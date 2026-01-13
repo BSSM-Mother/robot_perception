@@ -25,7 +25,6 @@ setup(
     entry_points={
         'console_scripts': [
             'person_detector = robot_perception.person_detector:main',
-            'camera_simulator = robot_perception.camera_simulator:main',
         ],
     },
 )
