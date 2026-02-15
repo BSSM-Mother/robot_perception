@@ -48,11 +48,11 @@ class PersonDetector(Node):
             # ROS 메시지를 OpenCV 이미지로 변환
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             
-            # YOLO 감지 실행 - sports ball (공) 감지
+            # YOLO 감지 실행 - person (사람) 감지
             results = self.model.predict(
                 source=cv_image,
-                classes=[32],  # 32: sports ball (공 모양 인식)
-                conf=0.05,  # 더 낮은 신뢰도 임계값
+                classes=[0],  # 0: person (사람 인식 - 앞/뒤/옆 모두 가능)
+                conf=0.3,  # 사람 감지를 위한 신뢰도 임계값
                 verbose=False,
                 show=False,
                 save=False
@@ -66,16 +66,16 @@ class PersonDetector(Node):
                 self.get_logger().debug(f"Detections: {len(r.boxes)} boxes")
                 
                 for box in r.boxes:
-                    # sports ball class 확인 (COCO dataset에서 sports ball은 32)
+                    # person class 확인 (COCO dataset에서 person은 0)
                     cls_id = int(box.cls[0])
                     confidence = float(box.conf[0])
                     
-                    if cls_id == 32:
+                    if cls_id == 0:
                         detection_count += 1
                         person_detected = True
                         
                         self.get_logger().info(
-                            f"✅ BALL DETECTED! Confidence: {confidence:.2f}")
+                            f"✅ PERSON DETECTED! Confidence: {confidence:.2f}")
                         
                         # 바운딩 박스 좌표
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -93,11 +93,11 @@ class PersonDetector(Node):
                         h, w = cv_image.shape[:2]
                         norm_x = (center_x - w/2) / (w/2)
                         # 새로운 방식: 화면에서 차지하는 비율
-                        # 목표: 공이 화면 높이의 약 30%를 차지할 때 이상적
+                        # 목표: 사람이 화면 높이의 약 50%를 차지할 때 이상적
                         screen_ratio = box_height / h
-                        target_ratio = 0.30
-                        # error_y: 양수 = 공이 크다 (가까움) = 뒤로
-                        #         음수 = 공이 작다 (멀다) = 앞으로
+                        target_ratio = 0.50
+                        # error_y: 양수 = 사람이 크다 (가까움) = 뒤로
+                        #         음수 = 사람이 작다 (멀다) = 앞으로
                         norm_y = (screen_ratio - target_ratio) / target_ratio
                         
                         # 위치 평활화 (EMA)
