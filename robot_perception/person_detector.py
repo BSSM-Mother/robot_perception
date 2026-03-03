@@ -72,8 +72,7 @@ class PersonDetector(Node):
                 small_image,
                 winStride=(8, 8),
                 padding=(8, 8),
-                scale=1.05,
-                finalThreshold=1.5
+                scale=1.05
             )
 
             person_detected = False
