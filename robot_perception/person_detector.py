@@ -154,7 +154,7 @@ class PersonDetector(Node):
             self.annotated_pub.publish(detection_msg)
 
         except Exception as e:
-            self.get_logger().error(f'Error processing image: {str(e)}', exc_info=True)
+            self.get_logger().error(f'Error processing image: {str(e)}')
 
 def main(args=None):
     rclpy.init(args=args)
