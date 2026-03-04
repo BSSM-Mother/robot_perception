@@ -62,10 +62,10 @@ Detection = namedtuple('Detection', ['x1', 'y1', 'x2', 'y2', 'cls_id', 'conf'])
 
 
 def _detect_model_path(declared_path: str, force_ncnn: bool = False) -> tuple:
-    """Return (resolved_path, mode) where mode is 'ncnn' or 'pt'.
+    """Return (resolved_path, mode) where mode is 'ncnn', 'onnx', or 'pt'.
 
-    Priority on ARM        : ncnn dir  → .pt file
-    Priority on x86        : .pt file  → ncnn dir
+    Priority on ARM        : onnx  → ncnn dir  → .pt file
+    Priority on x86        : .pt file  → ncnn dir  → onnx
     force_ncnn=True (any)  : ncnn dir only (for cross-arch testing)
     """
     arch = platform.machine()
@@ -79,8 +79,10 @@ def _detect_model_path(declared_path: str, force_ncnn: bool = False) -> tuple:
         ncnn_dir = base + '_ncnn_model'
 
     pt_file = base + '.pt'
+    onnx_file = base + '.onnx'
     ncnn_ok = os.path.isdir(ncnn_dir)
     pt_ok = os.path.isfile(pt_file)
+    onnx_ok = os.path.isfile(onnx_file)
 
     if force_ncnn:
         if ncnn_ok:
@@ -90,20 +92,27 @@ def _detect_model_path(declared_path: str, force_ncnn: bool = False) -> tuple:
         )
 
     if is_arm:
+        # ARM (Pi): onnx most stable, then ncnn, then pt
+        if onnx_ok:
+            return onnx_file, 'onnx'
         if ncnn_ok:
             return ncnn_dir, 'ncnn'
         if pt_ok:
             return pt_file, 'pt'
     else:
+        # x86: pt fastest with GPU/CPU, then ncnn, then onnx
         if pt_ok:
             return pt_file, 'pt'
         if ncnn_ok:
             return ncnn_dir, 'ncnn'
+        if onnx_ok:
+            return onnx_file, 'onnx'
 
     raise FileNotFoundError(
         f"No usable model found.\n"
-        f"  NCNN dir : {ncnn_dir} (exists={ncnn_ok})\n"
-        f"  .pt file : {pt_file}  (exists={pt_ok})"
+        f"  ONNX file : {onnx_file} (exists={onnx_ok})\n"
+        f"  NCNN dir  : {ncnn_dir} (exists={ncnn_ok})\n"
+        f"  .pt file  : {pt_file}  (exists={pt_ok})"
     )
 
 
