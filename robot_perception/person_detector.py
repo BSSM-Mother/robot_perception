@@ -2,219 +2,166 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
-from std_msgs.msg import String
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
 import os
 import sys
 import traceback
+from ultralytics import YOLO
+
+# COCO 클래스 인덱스
+CLASS_PERSON = 0
+CLASS_BALL = 32  # sports ball
+
 
 class PersonDetector(Node):
     def __init__(self):
         super().__init__('person_detector')
 
-        # OpenCV HOG 사람 감지기 초기화
+        # 모델 경로 파라미터
+        # PC/데스크탑:       'yolo11n.pt'
+        # Raspberry Pi (권장): NCNN 포맷 경로 'yolo11n_ncnn_model'
+        model_path = self.declare_parameter('model_path', 'yolo11n.pt').value
+        conf_thresh = self.declare_parameter('conf_threshold', 0.4).value
+
+        self.get_logger().info(f'Loading YOLO11 model: {model_path}')
         try:
-            self.get_logger().info('Initializing OpenCV HOG Person Detector...')
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            self.get_logger().info('✓ HOG detector initialized successfully')
+            # NCNN 모델 폴더가 없으면 자동으로 export
+            if not os.path.exists(model_path):
+                self.get_logger().warn(
+                    f'Model not found at "{model_path}". '
+                    'Downloading yolo11n.pt and exporting to NCNN...'
+                )
+                base_pt = 'yolo11n.pt'
+                tmp = YOLO(base_pt)          # .pt 자동 다운로드
+                exported = tmp.export(format='ncnn')
+                # export()가 반환하는 경로 or 기본 폴더명으로 재설정
+                ncnn_dir = str(exported) if exported else 'yolo11n_ncnn_model'
+                self.get_logger().info(f'✓ NCNN export complete: {ncnn_dir}')
+                model_path = ncnn_dir
 
-            # 감지 파라미터
-            self.detection_confidence = 0.5
-            self.use_hog = True
-
+            self.model = YOLO(model_path)
+            self.get_logger().info('✓ YOLO11 model loaded successfully')
         except Exception as e:
-            self.get_logger().error(f'Failed to initialize HOG detector: {str(e)}')
+            self.get_logger().error(f'Failed to load YOLO11 model: {e}')
             raise
+
+        self.conf_threshold = conf_thresh
         self.bridge = CvBridge()
+
+        # EMA 평활화 가중치 (최근값 비율)
+        self.alpha = 0.6
+        self.smooth_x = 0.0
+        self.smooth_y = 0.0
+        self.smooth_ball_x = 0.0
+        self.smooth_ball_y = 0.0
 
         # 구독/발행 설정
         self.image_sub = self.create_subscription(
             Image, '/camera/image_raw', self.image_callback, 10
         )
+        self.person_pos_pub = self.create_publisher(Point, 'person_position', 10)
+        self.ball_pos_pub = self.create_publisher(Point, 'ball_position', 10)
+        self.detection_pub = self.create_publisher(Image, 'detection_image', 10)
+        self.annotated_pub = self.create_publisher(Image, '/camera/annotated', 10)
 
-        self.person_pos_pub = self.create_publisher(
-            Point, 'person_position', 10
-        )
-
-        self.detection_pub = self.create_publisher(
-            Image, 'detection_image', 10
-        )
-        self.annotated_pub = self.create_publisher(
-            Image, '/camera/annotated', 10
-        )
-
-        self.get_logger().info('Person Detector initialized')
-        # 간단한 위치 평활화 변수
-        self.smooth_x = 0.0
-        self.smooth_y = 0.0
-        self.alpha = 0.6  # 최근값 가중치
-        # 볼(공) 감지 설정
-        self.use_ball_detection = True
-        self.ball_detection_confidence = 0.3
-        self.ball_pos_pub = self.create_publisher(
-            Point, 'ball_position', 10
-        )
-        self.smooth_ball_x = 0.0
-        self.smooth_ball_y = 0.0
+        self.get_logger().info('Person Detector (YOLO11) initialized')
 
     def image_callback(self, msg):
         """카메라 이미지 콜백"""
         try:
-            # ROS 메시지를 OpenCV 이미지로 변환
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             h, w = cv_image.shape[:2]
 
-            # HOG 사람 감지 실행
-            # Raspberry Pi 최적화: 이미지 크기 축소
-            scale = 1.0
-            if w > 640:
-                scale = 640.0 / w
-                small_image = cv2.resize(cv_image, None, fx=scale, fy=scale)
-            else:
-                small_image = cv_image
-
-            # HOG 감지 실행
-            boxes, weights = self.hog.detectMultiScale(
-                small_image,
-                winStride=(8, 8),
-                padding=(8, 8),
-                scale=1.05,
-                finalThreshold=1.5
-            )
+            # YOLO11 추론
+            # imgsz=320: Raspberry Pi 성능 최적화 (속도 우선)
+            # imgsz=640: 감지 정확도 우선 (데스크탑용)
+            results = self.model(
+                cv_image,
+                imgsz=320,
+                conf=self.conf_threshold,
+                classes=[CLASS_PERSON, CLASS_BALL],
+                verbose=False,
+            )[0]
 
             person_detected = False
-            detection_count = 0
+            ball_detected = False
 
-            # 감지된 사람들 처리
-            if len(boxes) > 0:
-                # 가장 큰 바운딩 박스 선택 (가장 가까운 사람)
-                areas = [(x, y, w_box, h_box, w_box * h_box, weight)
-                        for (x, y, w_box, h_box), weight in zip(boxes, weights)]
-                areas.sort(key=lambda x: x[4], reverse=True)
+            if results.boxes is not None:
+                # 신뢰도 내림차순 정렬
+                boxes = sorted(results.boxes, key=lambda b: float(b.conf[0]), reverse=True)
 
-                for x, y, w_box, h_box, area, weight in areas[:3]:  # 최대 3명까지
-                    if weight < self.detection_confidence:
-                        continue
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
 
-                    detection_count += 1
-                    person_detected = True
+                    if cls == CLASS_PERSON and not person_detected:
+                        person_detected = True
+                        box_h = y2 - y1
 
-                    # 원래 크기로 변환
-                    x1 = int(x / scale)
-                    y1 = int(y / scale)
-                    x2 = int((x + w_box) / scale)
-                    y2 = int((y + h_box) / scale)
+                        # 정규화 좌표 (-1 ~ 1)
+                        norm_x = (cx - w / 2.0) / (w / 2.0)
+                        screen_ratio = box_h / h
+                        norm_y = (screen_ratio - 0.5) / 0.5
 
-                    confidence = min(weight / 2.0, 1.0)  # 정규화
+                        # EMA 평활화
+                        self.smooth_x = self.alpha * norm_x + (1 - self.alpha) * self.smooth_x
+                        self.smooth_y = self.alpha * norm_y + (1 - self.alpha) * self.smooth_y
 
-                    self.get_logger().info(
-                        f"✅ PERSON DETECTED! Confidence: {confidence:.2f}")
+                        pos_msg = Point()
+                        pos_msg.x = self.smooth_x
+                        pos_msg.y = self.smooth_y
+                        pos_msg.z = conf
+                        self.person_pos_pub.publish(pos_msg)
 
-                    # 중심점 계산
-                    center_x = (x1 + x2) / 2
-                    center_y = (y1 + y2) / 2
+                        cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(cv_image, f'PERSON {conf:.2f}', (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        self.get_logger().info(
+                            f'✅ PERSON pos=({self.smooth_x:.2f},{self.smooth_y:.2f}) conf={conf:.2f}')
 
-                    # 바운딩 박스 크기 (거리 추정용)
-                    box_width = x2 - x1
-                    box_height = y2 - y1
+                    elif cls == CLASS_BALL and not ball_detected:
+                        ball_detected = True
+                        r = min(x2 - x1, y2 - y1) / 2.0
 
-                    # 정규화된 좌표로 변환 (-1 ~ 1)
-                    norm_x = (center_x - w/2) / (w/2)
-                    # 화면에서 차지하는 비율
-                    screen_ratio = box_height / h
-                    target_ratio = 0.50
-                    norm_y = (screen_ratio - target_ratio) / target_ratio
+                        norm_x_b = (cx - w / 2.0) / (w / 2.0)
+                        screen_ratio_b = (2 * r) / h
+                        norm_y_b = (screen_ratio_b - 0.05) / 0.05
 
-                    # 위치 평활화 (EMA)
-                    self.smooth_x = self.alpha * norm_x + (1 - self.alpha) * self.smooth_x
-                    self.smooth_y = self.alpha * norm_y + (1 - self.alpha) * self.smooth_y
-
-                    # 위치 발행 (평활화 사용)
-                    pos_msg = Point()
-                    pos_msg.x = self.smooth_x
-                    pos_msg.y = self.smooth_y
-                    pos_msg.z = confidence  # 신뢰도
-                    self.person_pos_pub.publish(pos_msg)
-
-                    # 시각화
-                    cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.circle(cv_image, (int(center_x), int(center_y)), 5, (0, 0, 255), -1)
-                    cv2.putText(cv_image, f'PERSON {confidence:.2f}', (x1, y1-10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                    self.get_logger().debug(
-                        f'Person detected: pos=({self.smooth_x:.2f}, {self.smooth_y:.2f}), conf={confidence:.2f}'
-                    )
-
-                    # 가장 큰 사람만 추적
-                    break
-
-            if not person_detected:
-                self.get_logger().info(f'⚠️ No person detected in this frame (image size: {cv_image.shape[1]}x{cv_image.shape[0]})')
-            else:
-                self.get_logger().info(f'✓ Person detected: {detection_count} detection(s)')
-
-            # 볼(공) 감지 (원형 탐지)
-            if self.use_ball_detection:
-                try:
-                    gray = cv2.cvtColor(small_image, cv2.COLOR_BGR2GRAY)
-                    gray = cv2.medianBlur(gray, 5)
-                    circles = cv2.HoughCircles(
-                        gray,
-                        cv2.HOUGH_GRADIENT,
-                        dp=1.2,
-                        minDist=30,
-                        param1=50,
-                        param2=30,
-                        minRadius=5,
-                        maxRadius=200,
-                    )
-                    if circles is not None:
-                        circles = np.uint16(np.around(circles))[0, :]
-                        circles = sorted(circles, key=lambda c: c[2], reverse=True)
-                        cx, cy, r = circles[0]
-                        # 원래 이미지 좌표로 변환
-                        cx_o = int(cx / scale)
-                        cy_o = int(cy / scale)
-                        r_o = int(r / scale)
-
-                        # 정규화된 좌표
-                        norm_x_b = (cx_o - w/2) / (w/2)
-                        screen_ratio_b = (2 * r_o) / h
-                        target_ratio_b = 0.05
-                        norm_y_b = (screen_ratio_b - target_ratio_b) / target_ratio_b
-
-                        # 위치 평활화
+                        # EMA 평활화
                         self.smooth_ball_x = self.alpha * norm_x_b + (1 - self.alpha) * self.smooth_ball_x
                         self.smooth_ball_y = self.alpha * norm_y_b + (1 - self.alpha) * self.smooth_ball_y
 
-                        # 발행
                         ball_msg = Point()
                         ball_msg.x = self.smooth_ball_x
                         ball_msg.y = self.smooth_ball_y
-                        ball_msg.z = min(1.0, r_o / float(h))
+                        ball_msg.z = conf
                         self.ball_pos_pub.publish(ball_msg)
 
-                        # 시각화
-                        cv2.circle(cv_image, (cx_o, cy_o), r_o, (255, 0, 0), 2)
-                        cv2.putText(cv_image, f'BALL {ball_msg.z:.2f}', (cx_o - r_o, cy_o - r_o - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                        self.get_logger().info(f'⚪ Ball detected: pos=({self.smooth_ball_x:.2f},{self.smooth_ball_y:.2f}), r={r_o}')
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    self.get_logger().error(f'Error during ball detection: {e}\n{tb}')
+                        cv2.rectangle(cv_image, (x1, y1), (x2, y2), (255, 80, 0), 2)
+                        cv2.circle(cv_image, (int(cx), int(cy)), int(r), (255, 80, 0), 2)
+                        cv2.putText(cv_image, f'BALL {conf:.2f}', (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 0), 2)
+                        self.get_logger().info(
+                            f'⚽ BALL pos=({self.smooth_ball_x:.2f},{self.smooth_ball_y:.2f}) conf={conf:.2f}')
 
-            # 감지 결과 이미지 발행
-            detection_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
-            self.detection_pub.publish(detection_msg)
-            self.annotated_pub.publish(detection_msg)
+            if not person_detected:
+                self.get_logger().debug('⚠️ No person detected in this frame')
+            if not ball_detected:
+                self.get_logger().debug('⚠️ No ball detected in this frame')
+
+            # 결과 이미지 발행
+            out_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
+            self.detection_pub.publish(out_msg)
+            self.annotated_pub.publish(out_msg)
 
         except Exception as e:
             tb = traceback.format_exc()
-            self.get_logger().error(f'Error processing image: {str(e)}\n{tb}')
+            self.get_logger().error(f'Error processing image: {e}\n{tb}')
 
 def main(args=None):
     rclpy.init(args=args)
