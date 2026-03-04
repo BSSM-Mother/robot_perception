@@ -1,184 +1,306 @@
+"""Person detector node using YOLO11.
+
+Publishes detected target position as geometry_msgs/Point:
+  x : horizontal offset from image centre, normalised to [-1, 1]
+        positive → target is to the right
+  y : distance proxy  =  (bbox_height / frame_height) - TARGET_HEIGHT_RATIO
+        negative → target is far (small bbox)
+        positive → target is close (large bbox)
+  z : detection confidence [0, 1]
+
+Topic interface
+---------------
+Subscribed : /camera/image_raw  (sensor_msgs/Image)
+Published  : /person_position   (geometry_msgs/Point)   ← consumed by tracking_controller
+             /camera/annotated  (sensor_msgs/Image)      ← debug visualisation
+
+Architecture handling
+---------------------
+* ARM (aarch64 / armv7l) — Raspberry Pi
+    Loads the NCNN model (<model_path>/ directory).
+    Falls back to .pt only as a last resort (slow on Pi).
+* x86_64 — development workstation
+    Tries .pt first (GPU / CPU, fast for dev), then NCNN as fallback.
+
+Debug mode
+----------
+TARGET_CLASSES contains both *person* (COCO 0) and *sports ball* (COCO 32).
+All detections are treated as a single "person" target for the controller.
+The highest-confidence detection is forwarded each frame.
+"""
+
+import platform
+import os
+from collections import namedtuple
+
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
-import cv2
 from cv_bridge import CvBridge
-import numpy as np
-import os
-import sys
-import traceback
-from ultralytics import YOLO
 
-# COCO 클래스 인덱스
-CLASS_PERSON = 0
-CLASS_BALL = 32  # sports ball
+# ── COCO class IDs treated as trackable targets ─────────────────────────────
+TARGET_CLASSES = {
+    0: 'person',
+    32: 'sports ball',
+}
+
+# Desired bounding-box height as a fraction of frame height.
+# Deviation from this ratio becomes error_y.
+TARGET_HEIGHT_RATIO = 0.40
+
+# Inference input resolution — smaller = faster (try 256 if Pi is still slow).
+INFER_SIZE = 320
+
+# Run inference once every N frames; annotated image is published every frame.
+# Raise this if the model is too slow (e.g. 4 on Pi).
+INFER_EVERY = 3
+
+Detection = namedtuple('Detection', ['x1', 'y1', 'x2', 'y2', 'cls_id', 'conf'])
+
+
+def _detect_model_path(declared_path: str, force_ncnn: bool = False) -> tuple:
+    """Return (resolved_path, mode) where mode is 'ncnn' or 'pt'.
+
+    Priority on ARM        : ncnn dir  → .pt file
+    Priority on x86        : .pt file  → ncnn dir
+    force_ncnn=True (any)  : ncnn dir only (for cross-arch testing)
+    """
+    arch = platform.machine()
+    is_arm = arch in ('aarch64', 'armv7l')
+
+    if declared_path.endswith('_ncnn_model') or os.path.isdir(declared_path):
+        ncnn_dir = declared_path
+        base = declared_path.rstrip('/').removesuffix('_ncnn_model')
+    else:
+        base = os.path.splitext(declared_path)[0]
+        ncnn_dir = base + '_ncnn_model'
+
+    pt_file = base + '.pt'
+    ncnn_ok = os.path.isdir(ncnn_dir)
+    pt_ok = os.path.isfile(pt_file)
+
+    if force_ncnn:
+        if ncnn_ok:
+            return ncnn_dir, 'ncnn'
+        raise FileNotFoundError(
+            f"force_ncnn=True but NCNN dir not found: {ncnn_dir}"
+        )
+
+    if is_arm:
+        if ncnn_ok:
+            return ncnn_dir, 'ncnn'
+        if pt_ok:
+            return pt_file, 'pt'
+    else:
+        if pt_ok:
+            return pt_file, 'pt'
+        if ncnn_ok:
+            return ncnn_dir, 'ncnn'
+
+    raise FileNotFoundError(
+        f"No usable model found.\n"
+        f"  NCNN dir : {ncnn_dir} (exists={ncnn_ok})\n"
+        f"  .pt file : {pt_file}  (exists={pt_ok})"
+    )
 
 
 class PersonDetector(Node):
+    """ROS 2 node that detects persons (and balls in debug mode) via YOLO11."""
+
     def __init__(self):
         super().__init__('person_detector')
 
-        # 모델 경로 파라미터
-        # PC/데스크탑:       'yolo11n.pt'
-        # Raspberry Pi (권장): NCNN 포맷 경로 'yolo11n_ncnn_model'
-        model_path = self.declare_parameter('model_path', 'yolo11n.pt').value
-        conf_thresh = self.declare_parameter('conf_threshold', 0.4).value
+        # ── Parameters ───────────────────────────────────────────────────────
+        self.declare_parameter('model_path', 'yolov8n_ncnn_model')
+        self.declare_parameter('conf_threshold', 0.35)
+        self.declare_parameter('iou_threshold', 0.45)
+        self.declare_parameter('target_height_ratio', TARGET_HEIGHT_RATIO)
+        self.declare_parameter('infer_size', INFER_SIZE)
+        self.declare_parameter('infer_every', INFER_EVERY)
+        self.declare_parameter('debug_track_all_targets', True)
+        self.declare_parameter('force_ncnn', False)
 
-        self.get_logger().info(f'Loading YOLO11 model: {model_path}')
+        raw_model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        self._conf = self.get_parameter('conf_threshold').get_parameter_value().double_value
+        self._iou = self.get_parameter('iou_threshold').get_parameter_value().double_value
+        self._target_h_ratio = self.get_parameter(
+            'target_height_ratio').get_parameter_value().double_value
+        self._infer_size = self.get_parameter('infer_size').get_parameter_value().integer_value
+        self._infer_every = self.get_parameter('infer_every').get_parameter_value().integer_value
+        debug_mode = self.get_parameter(
+            'debug_track_all_targets').get_parameter_value().bool_value
+        force_ncnn = self.get_parameter('force_ncnn').get_parameter_value().bool_value
+
+        self._target_classes = TARGET_CLASSES if debug_mode else {0: 'person'}
+
+        self.get_logger().info(f'Host architecture: {platform.machine()}')
+
+        # ── Load model ───────────────────────────────────────────────────────
         try:
-            # NCNN 모델 폴더가 없으면 자동으로 export
-            if not os.path.exists(model_path):
-                self.get_logger().warn(
-                    f'Model not found at "{model_path}". '
-                    'Downloading yolo11n.pt and exporting to NCNN...'
-                )
-                base_pt = 'yolo11n.pt'
-                tmp = YOLO(base_pt)          # .pt 자동 다운로드
-                exported = tmp.export(format='ncnn')
-                # export()가 반환하는 경로 or 기본 폴더명으로 재설정
-                ncnn_dir = str(exported) if exported else 'yolo11n_ncnn_model'
-                self.get_logger().info(f'✓ NCNN export complete: {ncnn_dir}')
-                model_path = ncnn_dir
+            model_path, mode = _detect_model_path(raw_model_path, force_ncnn=force_ncnn)
+        except FileNotFoundError as exc:
+            self.get_logger().fatal(str(exc))
+            raise SystemExit(1) from exc
 
-            self.model = YOLO(model_path)
-            self.get_logger().info('✓ YOLO11 model loaded successfully')
-        except Exception as e:
-            self.get_logger().error(f'Failed to load YOLO11 model: {e}')
-            raise
+        self.get_logger().info(f'Loading YOLO model [{mode.upper()}]: {model_path}')
+        from ultralytics import YOLO
+        self._model = YOLO(model_path)
 
-        self.conf_threshold = conf_thresh
-        self.bridge = CvBridge()
-
-        # EMA 평활화 가중치 (최근값 비율)
-        self.alpha = 0.6
-        self.smooth_x = 0.0
-        self.smooth_y = 0.0
-        self.smooth_ball_x = 0.0
-        self.smooth_ball_y = 0.0
-
-        # 구독/발행 설정
-        self.image_sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, 10
+        # Warm-up: triggers NCNN/CUDA init so first real frame is fast
+        self.get_logger().info('Warming up model...')
+        self._model.predict(
+            source=np.zeros((self._infer_size, self._infer_size, 3), dtype=np.uint8),
+            imgsz=self._infer_size,
+            verbose=False,
         )
-        self.person_pos_pub = self.create_publisher(Point, 'person_position', 10)
-        self.ball_pos_pub = self.create_publisher(Point, 'ball_position', 10)
-        self.detection_pub = self.create_publisher(Image, 'detection_image', 10)
-        self.annotated_pub = self.create_publisher(Image, '/camera/annotated', 10)
+        self.get_logger().info(
+            f'YOLO ready | targets={list(self._target_classes.values())} '
+            f'| conf>={self._conf} | imgsz={self._infer_size}'
+        )
 
-        self.get_logger().info('Person Detector (YOLO11) initialized')
+        # ── State ────────────────────────────────────────────────────────────
+        self._bridge = CvBridge()
+        self._frame_count = 0
+        self._infer_count = 0
+        self._det_count = 0
+        self._last_dets: list = []   # cached Detection namedtuples
+        self._last_best = None       # cached (error_x, error_y, conf) or None
 
-    def image_callback(self, msg):
-        """카메라 이미지 콜백"""
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            h, w = cv_image.shape[:2]
+        # ── ROS interfaces ───────────────────────────────────────────────────
+        self._img_sub = self.create_subscription(
+            Image, '/camera/image_raw', self._image_callback, 10)
+        self._pos_pub = self.create_publisher(Point, 'person_position', 10)
+        self._ann_pub = self.create_publisher(Image, '/camera/annotated', 10)
 
-            # YOLO11 추론
-            # imgsz=320: Raspberry Pi 성능 최적화 (속도 우선)
-            # imgsz=640: 감지 정확도 우선 (데스크탑용)
-            results = self.model(
-                cv_image,
-                imgsz=320,
-                conf=self.conf_threshold,
-                classes=[CLASS_PERSON, CLASS_BALL],
-                verbose=False,
-            )[0]
+    # ── Image callback ────────────────────────────────────────────────────────
 
-            person_detected = False
-            ball_detected = False
+    def _image_callback(self, msg: Image):
+        frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        h, w = frame.shape[:2]
 
-            if results.boxes is not None:
-                # 신뢰도 내림차순 정렬
-                boxes = sorted(results.boxes, key=lambda b: float(b.conf[0]), reverse=True)
+        # Run inference every N frames; use cached results otherwise.
+        self._frame_count += 1
+        if self._frame_count % self._infer_every == 0:
+            self._infer_count += 1
+            try:
+                results = self._model.predict(
+                    source=frame,
+                    imgsz=self._infer_size,
+                    conf=self._conf,
+                    iou=self._iou,
+                    classes=list(self._target_classes.keys()),
+                    verbose=False,
+                )
+                self._last_dets, self._last_best = self._parse_results(results, w, h)
+                if self._last_dets:
+                    self._det_count += 1
+                    best = self._last_best
+                    self.get_logger().info(
+                        f'[{self._frame_count}] Detected {len(self._last_dets)} target(s) | '
+                        f'best: ex={best[0]:+.2f} ey={best[1]:+.2f} conf={best[2]:.2f}'
+                    )
+                else:
+                    self.get_logger().debug(
+                        f'[{self._frame_count}] No targets detected'
+                    )
+            except Exception as exc:
+                self.get_logger().warn(f'Inference error: {exc}')
 
-                for box in boxes:
-                    cls = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
+            if self._last_best is not None:
+                pt = Point()
+                ex, ey, ec = self._last_best
+                pt.x, pt.y, pt.z = float(ex), float(ey), float(ec)
+                self._pos_pub.publish(pt)
 
-                    if cls == CLASS_PERSON and not person_detected:
-                        person_detected = True
-                        box_h = y2 - y1
+        # Log stats every 30 frames
+        if self._frame_count % 30 == 0:
+            self.get_logger().info(
+                f'Stats | frames={self._frame_count} '
+                f'infers={self._infer_count} '
+                f'frames_with_det={self._det_count} '
+                f'resolution={w}x{h}'
+            )
 
-                        # 정규화 좌표 (-1 ~ 1)
-                        norm_x = (cx - w / 2.0) / (w / 2.0)
-                        screen_ratio = box_h / h
-                        norm_y = (screen_ratio - 0.5) / 0.5
+        # Always publish annotated image (with cached boxes when skipping)
+        ann = self._annotate(frame, self._last_dets, w, h, self._last_best)
+        ann_msg = self._bridge.cv2_to_imgmsg(ann, encoding='bgr8')
+        ann_msg.header = msg.header
+        self._ann_pub.publish(ann_msg)
 
-                        # EMA 평활화
-                        self.smooth_x = self.alpha * norm_x + (1 - self.alpha) * self.smooth_x
-                        self.smooth_y = self.alpha * norm_y + (1 - self.alpha) * self.smooth_y
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-                        pos_msg = Point()
-                        pos_msg.x = self.smooth_x
-                        pos_msg.y = self.smooth_y
-                        pos_msg.z = conf
-                        self.person_pos_pub.publish(pos_msg)
+    def _parse_results(self, results, frame_w: int, frame_h: int):
+        """Return (list[Detection], best_tuple) from ultralytics results."""
+        dets = []
+        best_conf = -1.0
+        best = None
 
-                        cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(cv_image, f'PERSON {conf:.2f}', (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                        self.get_logger().info(
-                            f'✅ PERSON pos=({self.smooth_x:.2f},{self.smooth_y:.2f}) conf={conf:.2f}')
+        for result in results:
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            for box in result.boxes:
+                cls_id = int(box.cls[0].item())
+                if cls_id not in self._target_classes:
+                    continue
+                conf = float(box.conf[0].item())
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                dets.append(Detection(x1, y1, x2, y2, cls_id, conf))
 
-                    elif cls == CLASS_BALL and not ball_detected:
-                        ball_detected = True
-                        r = min(x2 - x1, y2 - y1) / 2.0
+                cx = (x1 + x2) / 2.0
+                bh = y2 - y1
+                error_x = (cx - frame_w / 2.0) / (frame_w / 2.0)
+                error_y = (bh / frame_h) - self._target_h_ratio
 
-                        norm_x_b = (cx - w / 2.0) / (w / 2.0)
-                        screen_ratio_b = (2 * r) / h
-                        norm_y_b = (screen_ratio_b - 0.05) / 0.05
+                if conf > best_conf:
+                    best_conf = conf
+                    best = (error_x, error_y, conf)
 
-                        # EMA 평활화
-                        self.smooth_ball_x = self.alpha * norm_x_b + (1 - self.alpha) * self.smooth_ball_x
-                        self.smooth_ball_y = self.alpha * norm_y_b + (1 - self.alpha) * self.smooth_ball_y
+        return dets, best
 
-                        ball_msg = Point()
-                        ball_msg.x = self.smooth_ball_x
-                        ball_msg.y = self.smooth_ball_y
-                        ball_msg.z = conf
-                        self.ball_pos_pub.publish(ball_msg)
+    def _annotate(
+        self, frame: np.ndarray, dets: list, frame_w: int, frame_h: int, best
+    ) -> np.ndarray:
+        ann = frame.copy()
 
-                        cv2.rectangle(cv_image, (x1, y1), (x2, y2), (255, 80, 0), 2)
-                        cv2.circle(cv_image, (int(cx), int(cy)), int(r), (255, 80, 0), 2)
-                        cv2.putText(cv_image, f'BALL {conf:.2f}', (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 0), 2)
-                        self.get_logger().info(
-                            f'⚽ BALL pos=({self.smooth_ball_x:.2f},{self.smooth_ball_y:.2f}) conf={conf:.2f}')
+        for d in dets:
+            x1, y1, x2, y2 = int(d.x1), int(d.y1), int(d.x2), int(d.y2)
+            label = f"{self._target_classes.get(d.cls_id, str(d.cls_id))} {d.conf:.2f}"
+            colour = (0, 255, 0) if d.cls_id == 0 else (0, 165, 255)
+            cv2.rectangle(ann, (x1, y1), (x2, y2), colour, 2)
+            cv2.putText(ann, label, (x1, max(y1 - 6, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
 
-            if not person_detected:
-                self.get_logger().debug('⚠️ No person detected in this frame')
-            if not ball_detected:
-                self.get_logger().debug('⚠️ No ball detected in this frame')
+        # Cross-hair at frame centre
+        cx, cy = frame_w // 2, frame_h // 2
+        cv2.line(ann, (cx - 14, cy), (cx + 14, cy), (180, 180, 180), 1)
+        cv2.line(ann, (cx, cy - 14), (cx, cy + 14), (180, 180, 180), 1)
 
-            # 결과 이미지 발행
-            out_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
-            self.detection_pub.publish(out_msg)
-            self.annotated_pub.publish(out_msg)
+        if best is not None:
+            ex, ey, ec = best
+            txt = f"ex={ex:+.2f}  ey={ey:+.2f}  conf={ec:.2f}"
+            cv2.putText(ann, txt, (6, frame_h - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(ann, "SEARCHING...", (6, frame_h - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.get_logger().error(f'Error processing image: {e}\n{tb}')
+        return ann
+
 
 def main(args=None):
     rclpy.init(args=args)
+    node = PersonDetector()
     try:
-        detector = PersonDetector()
-        rclpy.spin(detector)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f'Error in person_detector node: {e}', file=sys.stderr)
-        sys.exit(1)
     finally:
-        try:
-            detector.destroy_node()
-        except:
-            pass
-        rclpy.shutdown()
+        node.destroy_node()
+        rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()
