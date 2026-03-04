@@ -50,6 +50,14 @@ class PersonDetector(Node):
         self.smooth_x = 0.0
         self.smooth_y = 0.0
         self.alpha = 0.6  # 최근값 가중치
+        # 볼(공) 감지 설정
+        self.use_ball_detection = True
+        self.ball_detection_confidence = 0.3
+        self.ball_pos_pub = self.create_publisher(
+            Point, 'ball_position', 10
+        )
+        self.smooth_ball_x = 0.0
+        self.smooth_ball_y = 0.0
 
     def image_callback(self, msg):
         """카메라 이미지 콜백"""
@@ -72,7 +80,8 @@ class PersonDetector(Node):
                 small_image,
                 winStride=(8, 8),
                 padding=(8, 8),
-                scale=1.05
+                scale=1.05,
+                finalThreshold=1.5
             )
 
             person_detected = False
@@ -147,13 +156,62 @@ class PersonDetector(Node):
             else:
                 self.get_logger().info(f'✓ Person detected: {detection_count} detection(s)')
 
+            # 볼(공) 감지 (원형 탐지)
+            if self.use_ball_detection:
+                try:
+                    gray = cv2.cvtColor(small_image, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.medianBlur(gray, 5)
+                    circles = cv2.HoughCircles(
+                        gray,
+                        cv2.HOUGH_GRADIENT,
+                        dp=1.2,
+                        minDist=30,
+                        param1=50,
+                        param2=30,
+                        minRadius=5,
+                        maxRadius=200,
+                    )
+                    if circles is not None:
+                        circles = np.uint16(np.around(circles))[0, :]
+                        circles = sorted(circles, key=lambda c: c[2], reverse=True)
+                        cx, cy, r = circles[0]
+                        # 원래 이미지 좌표로 변환
+                        cx_o = int(cx / scale)
+                        cy_o = int(cy / scale)
+                        r_o = int(r / scale)
+
+                        # 정규화된 좌표
+                        norm_x_b = (cx_o - w/2) / (w/2)
+                        screen_ratio_b = (2 * r_o) / h
+                        target_ratio_b = 0.05
+                        norm_y_b = (screen_ratio_b - target_ratio_b) / target_ratio_b
+
+                        # 위치 평활화
+                        self.smooth_ball_x = self.alpha * norm_x_b + (1 - self.alpha) * self.smooth_ball_x
+                        self.smooth_ball_y = self.alpha * norm_y_b + (1 - self.alpha) * self.smooth_ball_y
+
+                        # 발행
+                        ball_msg = Point()
+                        ball_msg.x = self.smooth_ball_x
+                        ball_msg.y = self.smooth_ball_y
+                        ball_msg.z = min(1.0, r_o / float(h))
+                        self.ball_pos_pub.publish(ball_msg)
+
+                        # 시각화
+                        cv2.circle(cv_image, (cx_o, cy_o), r_o, (255, 0, 0), 2)
+                        cv2.putText(cv_image, f'BALL {ball_msg.z:.2f}', (cx_o - r_o, cy_o - r_o - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                        self.get_logger().info(f'⚪ Ball detected: pos=({self.smooth_ball_x:.2f},{self.smooth_ball_y:.2f}), r={r_o}')
+                except Exception as e:
+                    self.get_logger().error(f'Error during ball detection: {e}', exc_info=True)
+
             # 감지 결과 이미지 발행
             detection_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
             self.detection_pub.publish(detection_msg)
             self.annotated_pub.publish(detection_msg)
 
         except Exception as e:
-            self.get_logger().error(f'Error processing image: {str(e)}')
+            self.get_logger().error(f'Error processing image: {str(e)}', exc_info=True)
 
 def main(args=None):
     rclpy.init(args=args)
