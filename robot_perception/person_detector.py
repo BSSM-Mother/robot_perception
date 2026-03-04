@@ -77,7 +77,8 @@ class _CvDnnDetector:
         self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
     def predict(self, frame: np.ndarray, conf_thresh: float,
-                iou_thresh: float, target_classes: list) -> list:
+                iou_thresh: float, target_classes: list,
+                debug_logger=None, debug_call_idx: int = 0) -> list:
         """Return list of Detection(x1,y1,x2,y2,cls_id,conf) in frame coords."""
         orig_h, orig_w = frame.shape[:2]
         sz = self._infer_size
@@ -101,6 +102,26 @@ class _CvDnnDetector:
 
         # Transpose to (N, 84)
         preds = raw[0].T  # (N, 84)
+
+        # ── Debug: 매 30추론마다 전체 최대 confidence 출력 ───────────────
+        if debug_logger is not None and debug_call_idx % 30 == 0:
+            all_cls_scores = preds[:, 4:4 + NUM_CLASSES]   # (N, 80)
+            best_idx = int(np.argmax(all_cls_scores))
+            best_row = best_idx // NUM_CLASSES
+            best_cls = best_idx % NUM_CLASSES
+            best_conf = float(all_cls_scores[best_row, best_cls])
+            # top-5 classes by max confidence
+            cls_max = all_cls_scores.max(axis=0)           # (80,)
+            top5 = np.argsort(cls_max)[-5:][::-1]
+            top5_str = ', '.join(
+                f'cls{c}={cls_max[c]:.3f}' for c in top5
+            )
+            debug_logger(
+                f'[cv2.dnn diag] raw shape={raw.shape} '
+                f'best_cls={best_cls} best_conf={best_conf:.3f} '
+                f'top5=[{top5_str}] '
+                f'conf_thresh={conf_thresh}'
+            )
 
         dets = []
         boxes_raw, scores_raw, cls_ids_raw = [], [], []
@@ -299,7 +320,9 @@ class PersonDetector(Node):
                     # ARM cv2.dnn path
                     dets = self._cv_detector.predict(
                         frame, self._conf, self._iou,
-                        list(self._target_classes.keys())
+                        list(self._target_classes.keys()),
+                        debug_logger=self.get_logger().info,
+                        debug_call_idx=self._infer_count,
                     )
                     self._last_dets, self._last_best = \
                         self._dets_to_best(dets, w, h)
