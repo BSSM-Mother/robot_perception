@@ -8,6 +8,7 @@ from cv_bridge import CvBridge
 import numpy as np
 import os
 import sys
+import traceback
 
 class PersonDetector(Node):
     def __init__(self):
@@ -203,7 +204,8 @@ class PersonDetector(Node):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                         self.get_logger().info(f'⚪ Ball detected: pos=({self.smooth_ball_x:.2f},{self.smooth_ball_y:.2f}), r={r_o}')
                 except Exception as e:
-                    self.get_logger().error(f'Error during ball detection: {e}', exc_info=True)
+                    tb = traceback.format_exc()
+                    self.get_logger().error(f'Error during ball detection: {e}\n{tb}')
 
             # 감지 결과 이미지 발행
             detection_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
@@ -211,7 +213,8 @@ class PersonDetector(Node):
             self.annotated_pub.publish(detection_msg)
 
         except Exception as e:
-            self.get_logger().error(f'Error processing image: {str(e)}', exc_info=True)
+            tb = traceback.format_exc()
+            self.get_logger().error(f'Error processing image: {str(e)}\n{tb}')
 
 def main(args=None):
     rclpy.init(args=args)
