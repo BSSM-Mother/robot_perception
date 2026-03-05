@@ -231,7 +231,7 @@ class PersonDetector(Node):
 
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter('model_path', 'yolov8n_ncnn_model')
-        self.declare_parameter('conf_threshold', 0.35)
+        self.declare_parameter('conf_threshold', 0.20)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('target_height_ratio', TARGET_HEIGHT_RATIO)
         self.declare_parameter('infer_size', INFER_SIZE)
